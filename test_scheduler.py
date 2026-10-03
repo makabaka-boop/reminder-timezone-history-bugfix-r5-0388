@@ -11,6 +11,7 @@ from scheduler import (
     GapPolicy,
     ScheduleService,
     ScriptedTimezone,
+    StaleRevision,
     TimezoneRegistry,
     Transition,
 )
@@ -49,6 +50,12 @@ def make_registry() -> TimezoneRegistry:
             ],
             initial_offset=timedelta(hours=-4),
         )
+    )
+    registry.register(
+        ScriptedTimezone("Test/Tokyo", [], initial_offset=timedelta(hours=9))
+    )
+    registry.register(
+        ScriptedTimezone("Test/UTC", [], initial_offset=timedelta(0))
     )
     return registry
 
@@ -335,6 +342,329 @@ class ServiceTest(unittest.TestCase):
             if reminder["scheduled_local"] == "2024-03-10T09:00:00"
         ]
         self.assertEqual(cancelled_reminders, [])
+
+
+    def test_timezone_change_applies_from_local_date_without_touching_past(
+        self,
+    ) -> None:
+        series = self.service.create_series(
+            name="mover",
+            timezone="Test/Spring",
+            local_time="09:00",
+            starts_on=date(2024, 3, 1),
+        )
+        # Persist a wide window under the original zone first.
+        self.service.list_instances(date(2024, 3, 1), date(2024, 3, 20))
+
+        result = self.service.set_timezone(
+            series["series_id"],
+            timezone="Test/Tokyo",
+            effective_date=date(2024, 3, 15),
+            expected_revision=0,
+        )
+        self.assertEqual(result, {"timezone": "Test/Tokyo", "zone_revision": 1})
+
+        rows = {
+            date.fromisoformat(row["scheduled_local"][:10]): row
+            for row in self.service.list_instances(
+                date(2024, 3, 13), date(2024, 3, 16)
+            )
+        }
+        # Earlier local dates keep the old zone's evidence and revision 0.
+        self.assertEqual(rows[date(2024, 3, 13)]["utc_offset"], "-04:00")
+        self.assertEqual(rows[date(2024, 3, 13)]["utc_at"], "2024-03-13T13:00:00Z")
+        self.assertEqual(
+            rows[date(2024, 3, 13)]["rule_version"]["zone_revision"], 0
+        )
+        # On and after the effective date the wall time and phase are kept but
+        # the instant is resolved in the new zone.
+        self.assertEqual(
+            rows[date(2024, 3, 15)]["scheduled_local"], "2024-03-15T09:00:00"
+        )
+        self.assertEqual(rows[date(2024, 3, 15)]["utc_offset"], "+09:00")
+        self.assertEqual(rows[date(2024, 3, 15)]["utc_at"], "2024-03-15T00:00:00Z")
+        self.assertEqual(
+            rows[date(2024, 3, 15)]["reminder_due_at"], "2024-03-14T23:45:00Z"
+        )
+        self.assertEqual(
+            rows[date(2024, 3, 15)]["rule_version"]["zone_revision"], 1
+        )
+
+        # A restart must not reinterpret any date.
+        service = self.restart()
+        rows = {
+            date.fromisoformat(row["scheduled_local"][:10]): row
+            for row in service.list_instances(date(2024, 3, 13), date(2024, 3, 16))
+        }
+        self.assertEqual(rows[date(2024, 3, 13)]["utc_at"], "2024-03-13T13:00:00Z")
+        self.assertEqual(rows[date(2024, 3, 15)]["utc_at"], "2024-03-15T00:00:00Z")
+
+    def test_timezone_change_preserves_confirmed_and_sent_evidence(self) -> None:
+        series = self.service.create_series(
+            name="locked",
+            timezone="Test/Spring",
+            local_time="09:00",
+            starts_on=date(2024, 3, 10),
+        )
+        self.service.advance_clock(datetime(2024, 3, 10, 12, 45))
+        self.service.set_timezone(
+            series["series_id"],
+            timezone="Test/Tokyo",
+            effective_date=date(2024, 3, 10),
+            expected_revision=0,
+        )
+
+        rows = {
+            date.fromisoformat(row["scheduled_local"][:10]): row
+            for row in self.service.list_instances(date(2024, 3, 10), date(2024, 3, 11))
+        }
+        sent = rows[date(2024, 3, 10)]
+        # The already-sent instance is immutable evidence of the old zone.
+        self.assertTrue(sent["reminder_sent"])
+        self.assertEqual(sent["utc_at"], "2024-03-10T13:00:00Z")
+        self.assertEqual(sent["utc_offset"], "-04:00")
+        self.assertEqual(sent["rule_version"]["zone_revision"], 0)
+        # Unlocked later instances follow the new zone.
+        self.assertEqual(rows[date(2024, 3, 11)]["utc_offset"], "+09:00")
+        self.assertEqual(rows[date(2024, 3, 11)]["rule_version"]["zone_revision"], 1)
+
+        reminders = self.service.list_reminders()
+        self.assertEqual(len(reminders), 1)
+        self.assertEqual(reminders[0]["utc_at"], "2024-03-10T13:00:00Z")
+        self.assertEqual(reminders[0]["rule_version"]["zone_revision"], 0)
+
+        # Restarting keeps the original reminder and its frozen evidence; the
+        # unlocked later days fire their own (new-zone) reminders.
+        service = self.restart()
+        service.advance_clock(datetime(2024, 3, 12))
+        locked_reminders = [
+            reminder
+            for reminder in service.list_reminders()
+            if reminder["scheduled_local"] == "2024-03-10T09:00:00"
+        ]
+        self.assertEqual(len(locked_reminders), 1)
+        self.assertEqual(locked_reminders[0]["utc_at"], "2024-03-10T13:00:00Z")
+        self.assertEqual(
+            locked_reminders[0]["rule_version"]["zone_revision"], 0
+        )
+
+    def test_timezone_change_rematerializes_all_persisted_future_instances(
+        self,
+    ) -> None:
+        series = self.service.create_series(
+            name="partial",
+            timezone="Test/Spring",
+            local_time="10:00",
+            starts_on=date(2024, 5, 1),
+        )
+        # Only one day is persisted before the change.
+        self.service.list_instances(date(2024, 5, 10), date(2024, 5, 10))
+        self.service.set_timezone(
+            series["series_id"],
+            timezone="Test/Tokyo",
+            effective_date=date(2024, 5, 10),
+            expected_revision=0,
+        )
+        rows = {
+            date.fromisoformat(row["scheduled_local"][:10]): row
+            for row in self.service.list_instances(date(2024, 5, 9), date(2024, 5, 12))
+        }
+        self.assertEqual(rows[date(2024, 5, 9)]["utc_offset"], "-04:00")
+        self.assertEqual(rows[date(2024, 5, 10)]["utc_offset"], "+09:00")
+        self.assertEqual(rows[date(2024, 5, 10)]["utc_at"], "2024-05-10T01:00:00Z")
+        self.assertEqual(rows[date(2024, 5, 11)]["utc_offset"], "+09:00")
+
+    def test_timezone_change_keeps_exceptions_bound_to_their_local_dates(
+        self,
+    ) -> None:
+        series = self.service.create_series(
+            name="exceptions",
+            timezone="Test/Spring",
+            local_time="09:00",
+            starts_on=date(2024, 6, 1),
+        )
+        self.service.set_exception(series["series_id"], date(2024, 6, 3), "12:30")
+        self.service.cancel_date(series["series_id"], date(2024, 6, 4))
+        self.service.set_exception(series["series_id"], date(2024, 6, 7), "20:00")
+        self.service.set_timezone(
+            series["series_id"],
+            timezone="Test/Tokyo",
+            effective_date=date(2024, 6, 5),
+            expected_revision=0,
+        )
+        rows = {
+            date.fromisoformat(row["scheduled_local"][:10]): row
+            for row in self.service.list_instances(date(2024, 6, 2), date(2024, 6, 8))
+        }
+        # Pre-effective override keeps its wall time but resolves in the old
+        # zone; the cancellation remains a cancellation.
+        self.assertEqual(
+            rows[date(2024, 6, 3)]["scheduled_local"], "2024-06-03T12:30:00"
+        )
+        self.assertEqual(rows[date(2024, 6, 3)]["utc_at"], "2024-06-03T16:30:00Z")
+        self.assertEqual(rows[date(2024, 6, 4)]["status"], "cancelled")
+        # Post-effective normal and overridden days use the new zone.
+        self.assertEqual(rows[date(2024, 6, 5)]["utc_at"], "2024-06-05T00:00:00Z")
+        self.assertEqual(
+            rows[date(2024, 6, 7)]["scheduled_local"], "2024-06-07T20:00:00"
+        )
+        self.assertEqual(rows[date(2024, 6, 7)]["utc_at"], "2024-06-07T11:00:00Z")
+
+    def test_timezone_change_preserves_interval_phase_and_resolves_dst_rules(
+        self,
+    ) -> None:
+        # Biweekly phase anchored to the series start survives the zone cut.
+        weekly = self.service.create_series(
+            name="biweekly",
+            timezone="Test/Spring",
+            local_time="09:00",
+            starts_on=date(2024, 3, 5),
+            frequency=Frequency.WEEKLY,
+            interval=2,
+        )
+        self.service.set_timezone(
+            weekly["series_id"],
+            timezone="Test/Tokyo",
+            effective_date=date(2024, 3, 20),
+            expected_revision=0,
+        )
+        days = [
+            row["scheduled_local"][:10]
+            for row in self.service.list_instances(date(2024, 3, 1), date(2024, 4, 5))
+        ]
+        self.assertEqual(days, ["2024-03-05", "2024-03-19", "2024-04-02"])
+
+        # Moving INTO the spring zone at the gap date honors the gap policy.
+        gap_series = self.service.create_series(
+            name="into gap",
+            timezone="Test/Tokyo",
+            local_time="02:30",
+            starts_on=date(2024, 3, 8),
+            gap=GapPolicy.SKIP,
+        )
+        self.service.set_timezone(
+            gap_series["series_id"],
+            timezone="Test/Spring",
+            effective_date=date(2024, 3, 10),
+            expected_revision=0,
+        )
+        gap_rows = {
+            date.fromisoformat(row["scheduled_local"][:10]): row
+            for row in self.service.list_instances(
+                date(2024, 3, 9), date(2024, 3, 11)
+            )
+        }
+        self.assertEqual(gap_rows[date(2024, 3, 10)]["status"], "skipped")
+        self.assertEqual(
+            gap_rows[date(2024, 3, 10)]["skip_reason"], "nonexistent_local_time"
+        )
+        self.assertEqual(gap_rows[date(2024, 3, 11)]["utc_offset"], "-04:00")
+
+        # Moving INTO the fall zone at the overlap honors the ambiguity policy.
+        amb = self.service.create_series(
+            name="into overlap",
+            timezone="Test/Tokyo",
+            local_time="01:30",
+            starts_on=date(2024, 11, 2),
+            ambiguous=AmbiguousPolicy.SECOND,
+        )
+        self.service.set_timezone(
+            amb["series_id"],
+            timezone="Test/Fall",
+            effective_date=date(2024, 11, 3),
+            expected_revision=0,
+        )
+        overlap_rows = [
+            row
+            for row in self.service.list_instances(
+                date(2024, 11, 3), date(2024, 11, 3)
+            )
+            if row["series_id"] == amb["series_id"]
+        ]
+        self.assertEqual(len(overlap_rows), 1)
+        row = overlap_rows[0]
+        self.assertEqual(row["ambiguous_occurrence"], 2)
+        self.assertEqual(row["utc_at"], "2024-11-03T06:30:00Z")
+
+    def test_stale_or_invalid_timezone_change_is_atomic(self) -> None:
+        series = self.service.create_series(
+            name="revisioned",
+            timezone="Test/Spring",
+            local_time="09:00",
+            starts_on=date(2024, 7, 1),
+        )
+        self.service.set_timezone(
+            series["series_id"],
+            timezone="Test/Tokyo",
+            effective_date=date(2024, 7, 5),
+            expected_revision=0,
+        )
+
+        with self.assertRaises(StaleRevision):
+            self.service.set_timezone(
+                series["series_id"],
+                timezone="Test/UTC",
+                effective_date=date(2024, 7, 8),
+                expected_revision=0,
+            )
+
+        with sqlite3.connect(self.db_path) as raw:
+            timezone = raw.execute(
+                "SELECT timezone FROM series WHERE id = ?", (series["series_id"],)
+            ).fetchone()[0]
+            revisions = [
+                row[0]
+                for row in raw.execute(
+                    "SELECT zone_revision FROM series_timezone_history "
+                    "WHERE series_id = ? ORDER BY zone_revision",
+                    (series["series_id"],),
+                )
+            ]
+        self.assertEqual(timezone, "Test/Tokyo")
+        self.assertEqual(revisions, [0, 1])
+
+        # The rejected change must not have rebuilt the instances either.
+        row = self.service.list_instances(date(2024, 7, 5), date(2024, 7, 5))[0]
+        self.assertEqual(row["utc_offset"], "+09:00")
+        self.assertEqual(row["rule_version"]["zone_revision"], 1)
+
+    def test_consecutive_timezone_chains_compose(self) -> None:
+        series = self.service.create_series(
+            name="chain",
+            timezone="Test/Spring",
+            local_time="09:00",
+            starts_on=date(2024, 8, 1),
+        )
+        self.service.set_timezone(
+            series["series_id"],
+            timezone="Test/Tokyo",
+            effective_date=date(2024, 8, 5),
+            expected_revision=0,
+        )
+        self.service.set_timezone(
+            series["series_id"],
+            timezone="Test/UTC",
+            effective_date=date(2024, 8, 10),
+            expected_revision=1,
+        )
+        # A same-day correction based on revision 2 supersedes the 8/10 rule.
+        self.service.set_timezone(
+            series["series_id"],
+            timezone="Test/Spring",
+            effective_date=date(2024, 8, 10),
+            expected_revision=2,
+        )
+        rows = {
+            date.fromisoformat(row["scheduled_local"][:10]): row
+            for row in self.service.list_instances(date(2024, 8, 4), date(2024, 8, 11))
+        }
+        self.assertEqual(rows[date(2024, 8, 4)]["utc_offset"], "-04:00")
+        self.assertEqual(rows[date(2024, 8, 5)]["utc_offset"], "+09:00")
+        self.assertEqual(rows[date(2024, 8, 9)]["utc_offset"], "+09:00")
+        self.assertEqual(rows[date(2024, 8, 10)]["utc_offset"], "-04:00")
+        self.assertEqual(
+            rows[date(2024, 8, 10)]["rule_version"]["zone_revision"], 3
+        )
 
 
 if __name__ == "__main__":

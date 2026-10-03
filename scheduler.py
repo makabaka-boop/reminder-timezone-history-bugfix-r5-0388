@@ -20,6 +20,22 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 from zoneinfo import ZoneInfo
 
+from zone_history import StaleRevision, series_zone_entries  # re-exported
+
+__all__ = [
+    "AmbiguousPolicy",
+    "ConflictingOccurrence",
+    "Frequency",
+    "GapPolicy",
+    "ScheduleService",
+    "ScriptedTimezone",
+    "StaleRevision",
+    "Timezone",
+    "TimezoneRegistry",
+    "Transition",
+    "ZoneInfoTimezone",
+]
+
 
 UTC = timezone.utc
 REMINDER_LEAD = timedelta(minutes=15)
@@ -369,6 +385,7 @@ CREATE TABLE IF NOT EXISTS occurrences (
     ambiguous_occurrence INTEGER,
     version_id INTEGER NOT NULL REFERENCES series_versions(id),
     version_no INTEGER NOT NULL,
+    zone_revision INTEGER NOT NULL DEFAULT 0,
     exception_id INTEGER REFERENCES exceptions(id),
     exception_revision INTEGER,
     reminder_due_at TEXT,
@@ -400,6 +417,7 @@ CREATE TABLE IF NOT EXISTS clock_state (
 @dataclass(frozen=True)
 class OccurrenceFingerprint:
     version_id: int
+    zone_revision: int
     exception_id: Optional[int]
     exception_revision: Optional[int]
     status: str
@@ -573,6 +591,10 @@ class ScheduleService:
                     "SELECT * FROM series_versions WHERE series_id = ?",
                     (series_id,),
                 ).fetchone()
+
+                from zone_history import seed_series
+
+                seed_series(conn, series_id, timezone, starts_on, now.isoformat())
         return self._series_version_payload(version)
 
     def modify_series(
@@ -845,6 +867,7 @@ class ScheduleService:
                             o.reason AS reason,
                             o.version_id AS version_id,
                             o.version_no AS version_no,
+                            o.zone_revision AS zone_revision,
                             o.exception_id AS exception_id,
                             o.exception_revision AS exception_revision
                         FROM reminders r
@@ -918,6 +941,7 @@ class ScheduleService:
                         o.reason AS reason,
                         o.version_id AS version_id,
                         o.version_no AS version_no,
+                        o.zone_revision AS zone_revision,
                         o.exception_id AS exception_id,
                         o.exception_revision AS exception_revision
                     FROM reminders r
@@ -949,6 +973,7 @@ class ScheduleService:
                     o.reason AS reason,
                     o.version_id AS version_id,
                     o.version_no AS version_no,
+                    o.zone_revision AS zone_revision,
                     o.exception_id AS exception_id,
                     o.exception_revision AS exception_revision
                 FROM reminders r
@@ -1003,6 +1028,8 @@ class ScheduleService:
                 (series["id"],),
             ).fetchall()
 
+            zone_entries = series_zone_entries(conn, series["id"])
+
             for day in dates:
                 effective_versions = [
                     row
@@ -1022,9 +1049,9 @@ class ScheduleService:
 
                 key = (series["id"], day.isoformat())
                 exception = exception_map.get(key)
-                from zone_history import zone_at
-
-                zone_name, zone_revision = zone_at(conn, series, day)
+                zone_name, zone_revision = self._zone_at(
+                    series, zone_entries, day
+                )
                 zone = self.timezones.get(zone_name)
                 detail = self._resolve_desired(
                     zone=zone,
@@ -1032,6 +1059,7 @@ class ScheduleService:
                     day=day,
                     exception=exception,
                     now=now,
+                    zone_revision=zone_revision,
                 )
                 desired[key] = self._fingerprint(detail)
                 details[key] = detail
@@ -1057,9 +1085,10 @@ class ScheduleService:
                 INSERT INTO occurrences(
                     series_id, scheduled_local_date, scheduled_local_time,
                     actual_local, utc_at, utc_offset, status, reason, adjustment,
-                    ambiguous_occurrence, version_id, version_no, exception_id,
-                    exception_revision, reminder_due_at, materialized_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ambiguous_occurrence, version_id, version_no, zone_revision,
+                    exception_id, exception_revision, reminder_due_at,
+                    materialized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     key[0],
@@ -1074,6 +1103,7 @@ class ScheduleService:
                     detail["ambiguous_occurrence"],
                     detail["version_id"],
                     detail["version_no"],
+                    detail["zone_revision"],
                     detail["exception_id"],
                     detail["exception_revision"],
                     detail["reminder_due_at"],
@@ -1085,6 +1115,28 @@ class ScheduleService:
     def _date_range(start: date, end: date) -> list[date]:
         count = (end - start).days
         return [start + timedelta(days=index) for index in range(count + 1)]
+
+    @staticmethod
+    def _zone_at(
+        series: sqlite3.Row,
+        zone_entries: list[sqlite3.Row],
+        day: date,
+    ) -> tuple[str, int]:
+        """Pick the timezone effective for a local date.
+
+        ``zone_entries`` is ordered by ``zone_revision`` ascending.  When
+        several changes are effective on the same day (repeatedly corrected
+        submissions), the latest revision wins; later submissions can only
+        rewrite unlocked instances anyway.
+        """
+        day_text = day.isoformat()
+        name = series["timezone"]
+        revision = 0
+        for entry in zone_entries:
+            if entry["effective_date"] <= day_text:
+                name = entry["timezone"]
+                revision = entry["zone_revision"]
+        return name, revision
 
     @staticmethod
     def _belongs_to_version(version: sqlite3.Row, day: date) -> bool:
@@ -1110,6 +1162,7 @@ class ScheduleService:
         day: date,
         exception: Optional[sqlite3.Row],
         now: datetime,
+        zone_revision: int = 0,
     ) -> dict[str, Any]:
         scheduled_time = version["local_time"]
         status = "scheduled"
@@ -1132,6 +1185,7 @@ class ScheduleService:
                     "ambiguous_occurrence": None,
                     "version_id": version["id"],
                     "version_no": version["version_no"],
+                    "zone_revision": zone_revision,
                     "exception_id": exception_id,
                     "exception_revision": exception_revision,
                     "reminder_due_at": None,
@@ -1179,6 +1233,7 @@ class ScheduleService:
             "ambiguous_occurrence": ambiguous_occurrence,
             "version_id": version["id"],
             "version_no": version["version_no"],
+            "zone_revision": zone_revision,
             "exception_id": exception_id,
             "exception_revision": exception_revision,
             "reminder_due_at": due_text,
@@ -1195,6 +1250,7 @@ class ScheduleService:
     def _fingerprint(detail: dict[str, Any]) -> OccurrenceFingerprint:
         return OccurrenceFingerprint(
             version_id=detail["version_id"],
+            zone_revision=detail["zone_revision"],
             exception_id=detail["exception_id"],
             exception_revision=detail["exception_revision"],
             status=detail["status"],
@@ -1212,6 +1268,7 @@ class ScheduleService:
     def _fingerprint_from_row(row: sqlite3.Row) -> OccurrenceFingerprint:
         return OccurrenceFingerprint(
             version_id=row["version_id"],
+            zone_revision=row["zone_revision"],
             exception_id=row["exception_id"],
             exception_revision=row["exception_revision"],
             status=row["status"],
@@ -1280,6 +1337,7 @@ class ScheduleService:
             "rule_version": {
                 "version_id": row["version_id"],
                 "version_no": row["version_no"],
+                "zone_revision": row["zone_revision"],
                 "exception_id": row["exception_id"],
                 "exception_revision": row["exception_revision"],
             },
@@ -1306,6 +1364,7 @@ class ScheduleService:
             "rule_version": {
                 "version_id": row["version_id"],
                 "version_no": row["version_no"],
+                "zone_revision": row["zone_revision"],
                 "exception_id": row["exception_id"],
                 "exception_revision": row["exception_revision"],
             },
