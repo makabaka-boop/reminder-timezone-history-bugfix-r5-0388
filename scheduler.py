@@ -569,6 +569,9 @@ class ScheduleService:
                         now.isoformat(),
                     ),
                 )
+                from zone_history import record_baseline
+
+                record_baseline(conn, series_id, timezone, now)
                 version = conn.execute(
                     "SELECT * FROM series_versions WHERE series_id = ?",
                     (series_id,),
